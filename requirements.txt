@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]==0.30.6
+openai
+faiss-cpu
+numpy
+mysql-connector-python
+pymongo
+requests
+python-dotenv
+pydantic
