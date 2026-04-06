@@ -83,14 +83,14 @@ Typical query patterns:
   - use faiss for semantic search, then get partner_name for context using fiass_id
 """
 # Model Configuration
-MODEL_CONTEXT_DETERMINER = "gpt-4.1-mini"
-MODEL_QUERY_REASONER = "gpt-4.1-mini"
-MODEL_SQL_GENERATOR = "gpt-4.1-mini"
-MODEL_SPARQL_GENERATOR = "gpt-4.1-mini" # Used for both Internal and External SPARQL
-MODEL_ANSWER_SYNTHESIZER = "gpt-4o-mini"
+MODEL_CONTEXT_DETERMINER = "gpt-5.4-nano"
+MODEL_QUERY_REASONER = "gpt-5.4-nano"
+MODEL_SQL_GENERATOR = "gpt-5.4-nano"
+MODEL_SPARQL_GENERATOR = "gpt-5.4-mini" # Used for both Internal and External SPARQL
+MODEL_ANSWER_SYNTHESIZER = "gpt-5.4-nano"
 MODEL_EMBEDDING = "text-embedding-3-small"
 
-FAISS_TOP_K = 3
+FAISS_TOP_K = 8
 
 # Schemas
 MYSQL_SCHEMA = """
@@ -364,7 +364,7 @@ class ContextDeterminer:
             "can_answer_internally": true/false,
             "needs_external_context": true/false,
             "external_search_query": "query for Wikidata" or null,
-            "reasoning": "brief explanation"
+            "reasoning": "brief explanation" (in english)
         }
         """
 
@@ -474,6 +474,7 @@ CRITICAL RULES:
   to retrieve OUR specific data that complements the external knowledge
 - Do NOT try to answer general knowledge questions via internal DBs 
   when Wikidata is already handling that
+- do it in english, regardless of user initial question language, to ensure consistent LLM understanding
 
 EXAMPLES:
 
@@ -625,7 +626,7 @@ Rules:
 7. Always include wikidb. prefix before table names
 8. PRESERVE original terms from the question (don't translate "hibah" to "grant", "wikidata" stays "wikidata")
 9. Search for the EXACT words mentioned in the question
-10. Always LIMIT results to 5 rows, Unless asked otherwise
+10. Always LIMIT results to 50 rows, Unless asked otherwise
 11.. for WHERE conditions text matching use to lowercase so that "s3" and "S3" are the same
 12. for questions asking for counts, return a single row with the count and label the column as count
 
@@ -1143,7 +1144,13 @@ QUERY RULES
 3. **Output Format:**
    - Return ONLY the SPARQL code block. No text, no markdown, no explanations.
 
-4. ALWAYS LIMIT TO 5, UNLESS SPECIFIED OTHERWISE.
+4. Try to make it that no URL e.g http://38.147.122.59/entity/Q64 appears in the final output, values
+
+5. ALWAYS LIMIT TO 100, UNLESS SPECIFIED OTHERWISE.
+
+6. Always Sort alphabetically by the main variable (lecturer/names first, paper second, partner name if needed) for consistent output.
+
+7. for any type of questions regarding lecturers/Dosen, ALWAYS sure to print/output the names
 
 
 ────────────────────────────────────────
@@ -1330,7 +1337,7 @@ class MongoDBPartnershipExecutor:
         client: OpenAI,
         faiss_executor,                 # FAISSQueryExecutor — passed in, not imported
         mongo_config: Dict = None,
-        model: str = "gpt-4.1-mini",
+        model: str = "gpt-5.4-nano",
     ):
         self.client = client
         self.faiss_executor = faiss_executor
@@ -1676,8 +1683,7 @@ class AnswerSynthesizer:
                             f"partner_name, title, and summary):"
                         )
                     }
-                ],
-                max_tokens=1500  # was 500 — gives room for complete extraction
+                ] # was 500 — gives room for complete extraction
             )
             return f"[{source_label}]\n{resp.choices[0].message.content.strip()}"
         except Exception as e:
@@ -1809,8 +1815,7 @@ class AnswerSynthesizer:
                             f"Do not omit any item found in the context."
                         )
                     }
-                ],
-                max_tokens=2000  # explicit ceiling so long lists aren't cut off
+                ]  # explicit ceiling so long lists aren't cut off
             )
             stats.llm_calls += 1
             return resp.choices[0].message.content.strip()
