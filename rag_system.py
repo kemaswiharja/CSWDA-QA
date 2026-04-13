@@ -83,11 +83,11 @@ Typical query patterns:
   - use faiss for semantic search, then get partner_name for context using fiass_id
 """
 # Model Configuration
-MODEL_CONTEXT_DETERMINER = "gpt-5.4-nano"
-MODEL_QUERY_REASONER = "gpt-5.4-nano"
+MODEL_CONTEXT_DETERMINER = "gpt-4.1-mini"
+MODEL_QUERY_REASONER = "gpt-4.1-mini"
 MODEL_SQL_GENERATOR = "gpt-5.4-nano"
 MODEL_SPARQL_GENERATOR = "gpt-5.4-mini" # Used for both Internal and External SPARQL
-MODEL_ANSWER_SYNTHESIZER = "gpt-5.4-nano"
+MODEL_ANSWER_SYNTHESIZER = "gpt-4.1-mini"
 MODEL_EMBEDDING = "text-embedding-3-small"
 
 FAISS_TOP_K = 8
@@ -176,6 +176,7 @@ Properties:
 - P6 (Has Partnership): Institution -> wdt:P6 -> Partner
 - P7 (Has Faculty): Institution -> wdt:P7 -> Faculty
 - P8 (Affiliation): Person -> wdt:P8 -> Organization
+- P10 (Co Author): Paper -> wdt:P10 -> STRING (the co-author name as string, since we don't have all co-authors as items))
 
 SPARQL Prefixes:
 PREFIX wd:       <http://38.147.122.59/entity/>
@@ -464,6 +465,29 @@ IMPORTANT: MongoDB has TWO query strategies:
 YOUR TASK:
 Determine which database(s) to query and generate SPECIFIC sub-questions for each.
 
+────────────────────────────────────────
+WIKIBASE CO-AUTHOR PLANNING RULE
+────────────────────────────────────────
+
+In the knowledge graph, co-authorship is represented in two ways:
+1) STRING-based co-authors via "Co Author" (P10)
+2) ENTITY-based co-authors via multiple lecturers linked to the same paper using "Has Researched" (P1)
+
+When generating a Wikibase sub-question:
+
+1. If the question involves co-authors of a PAPER:
+   - The sub-question MUST explicitly request co-author names from the "Co Author" (P10) property.
+
+2. If the question involves co-authors of a LECTURER:
+   - The sub-question MUST explicitly request BOTH:
+     a) Co-author names from the "Co Author" (P10) property through the lecturer’s papers
+     b) Other lecturers who have authored the same papers (via shared "Has Researched" (P1) relationships)
+
+3. The sub-question must clearly mention BOTH retrieval paths.
+   - Do NOT describe co-authors in a generic way.
+   - Do NOT rely on only one source.
+
+4. Always specify that lecturer names should be included when retrieving entity-based co-authors.
 CRITICAL RULES:
 - Each sub-question must be SELF-CONTAINED and answerable by that database alone
 - Sub-questions should be MORE DETAILED than the original question, adding context
@@ -475,6 +499,7 @@ CRITICAL RULES:
 - Do NOT try to answer general knowledge questions via internal DBs 
   when Wikidata is already handling that
 - do it in english, regardless of user initial question language, to ensure consistent LLM understanding
+- if CSWDA is mentioned, ignore it, do not include it in any sub-questions, and do not use it as a signal for database choice
 
 EXAMPLES:
 
@@ -598,8 +623,6 @@ RESPOND ONLY WITH VALID JSON:
 
 
 
-
-
 # =================================================================================
 # EXECUTORS (MySQL, FAISS, Internal Wikibase)
 # =================================================================================
@@ -626,7 +649,7 @@ Rules:
 7. Always include wikidb. prefix before table names
 8. PRESERVE original terms from the question (don't translate "hibah" to "grant", "wikidata" stays "wikidata")
 9. Search for the EXACT words mentioned in the question
-10. Always LIMIT results to 50 rows, Unless asked otherwise
+10. Always LIMIT results to 150 rows, Unless asked otherwise
 11.. for WHERE conditions text matching use to lowercase so that "s3" and "S3" are the same
 12. for questions asking for counts, return a single row with the count and label the column as count
 
@@ -648,7 +671,7 @@ Rules:
 7. Always include wikidb. prefix before table names
 8. PRESERVE original terms from the question (don't translate "hibah" to "grant", "wikidata" stays "wikidata")
 9. Search for the EXACT words mentioned in the question
-10. Always LIMIT results to 5 rows, Unless asked otherwise
+10. Always LIMIT results to 50 rows, Unless asked otherwise
 11.. for WHERE conditions text matching use to lowercase so that "s3" and "S3" are the same
 12. for questions asking for counts, return a single row with the count and label the column as count"""
 
@@ -1054,110 +1077,158 @@ class InternalWikibaseExecutor:
     def generate_sparql(self, question: str) -> str:
         """Generate SPARQL query from natural language question"""
         prompt = f"""
-{WIKIBASE_SCHEMA}
+            {WIKIBASE_SCHEMA}
 
-You are a SPARQL Query Generator for a Wikibase Cloud instance. Your goal is to generate precise, working SPARQL queries that retrieve Lecturers, Papers, and Partnerships.
+            You are a SPARQL Query Generator for a Wikibase Cloud instance. Your goal is to generate precise, working SPARQL queries that retrieve Lecturers, Papers, and Partnerships.
 
-────────────────────────────────────────
-PREFIXES
-────────────────────────────────────────
-PREFIX wd:       <http://38.147.122.59/entity/>
-PREFIX wdt:      <http://38.147.122.59/prop/direct/>
-PREFIX p:        <http://38.147.122.59/prop/>
-PREFIX ps:       <http://38.147.122.59/prop/statement/>
-PREFIX bd:       <http://www.bigdata.com/rdf#>
-PREFIX wikibase: <http://wikiba.se/ontology#>
-PREFIX rdfs:     <http://www.w3.org/2000/01/rdf-schema#>
+            ────────────────────────────────────────
+            PREFIXES
+            ────────────────────────────────────────
+            PREFIX wd:       <http://38.147.122.59/entity/>
+            PREFIX wdt:      <http://38.147.122.59/prop/direct/>
+            PREFIX p:        <http://38.147.122.59/prop/>
+            PREFIX ps:       <http://38.147.122.59/prop/statement/>
+            PREFIX bd:       <http://www.bigdata.com/rdf#>
+            PREFIX wikibase: <http://wikiba.se/ontology#>
+            PREFIX rdfs:     <http://www.w3.org/2000/01/rdf-schema#>
 
-────────────────────────────────────────
-DATA SCHEMA
-────────────────────────────────────────
-- P1 (Has Researched): Lecturer -> wdt:P1 -> Paper
-- P2 (Has Patent):     Lecturer -> wdt:P2 -> Patent
-- P3 (is Lecturer):    Entity   -> wdt:P3 -> [] (Type check)
-- P4 (is Paper):       Entity   -> wdt:P4 -> [] (Type check)
-- P5 (is Patent):      Entity   -> wdt:P5 -> [] (Type check)
-- P6 (Has Partnership): Institution -> wdt:P6 -> Partner
-- P7 (Has Faculty):    Institution -> wdt:P7 -> Faculty
-- P8 (Affiliation):    Person      -> wdt:P8 -> Organization
-- P9 (Has Specialty):  Lecturer    -> wdt:P9 -> Specialty
+            ────────────────────────────────────────
+            DATA SCHEMA
+            ────────────────────────────────────────
+            - P1 (Has Researched): Lecturer -> wdt:P1 -> Paper
+            - P2 (Has Patent):     Lecturer -> wdt:P2 -> Patent
+            - P3 (is Lecturer):    Entity   -> wdt:P3 -> [] (Type check)
+            - P4 (is Paper):       Entity   -> wdt:P4 -> [] (Type check)
+            - P5 (is Patent):      Entity   -> wdt:P5 -> [] (Type check)
+            - P6 (Has Partnership): Institution -> wdt:P6 -> Partner
+            - P7 (Has Faculty):    Institution -> wdt:P7 -> Faculty
+            - P8 (Affiliation):    Person      -> wdt:P8 -> Organization
+            - P9 (Has Specialty):  Lecturer    -> wdt:P9 -> Specialty
+            - P10 (Co Author):       Paper       -> wdt:P10 -> STRING (co-author name, not an entity link)
 
-────────────────────────────────────────
-***CRITICAL STRATEGY FOR 0-RESULT PREVENTION****
-────────────────────────────────────────
-To ensure you find results, you must use this specific search pattern:
+            ────────────────────────────────────────
+            CO-AUTHOR HANDLING RULES (P10)
+            ────────────────────────────────────────
 
-1. **SEARCH PHASE (Finding the Subject):**
-   - NEVER assume you know the Q-ID (e.g., do not guess wd:Q123).
-   - ALWAYS search for the subject by matching its label.
-   - Use `FILTER(CONTAINS(LCASE(?label), "search term"))` which is more robust than REGEX.
-   - **Important:** Search specifically on `rdfs:label`, NOT `wikibase:label`.
+            P10 (Co Author) stores co-author names as STRING values.
+            This property includes all co-authors EXCEPT the main author.
 
-2. **RETRIEVAL PHASE (Traversing):**
-   - Once the variable `?subject` is bound, follow the `wdt:P...` paths.
+            However, some co-authors may also exist as Lecturer entities (items) in the KG.
 
-3. **DISPLAY PHASE:**
-   - Use `SERVICE wikibase:label` only to get the nice names of the *found* items (the results).
+            You MUST follow these rules depending on the query:
 
-────────────────────────────────────────
-STRICT NAME MATCHING RULES FOR LLM SPARQL GENERATION
-────────────────────────────────────────
+            1. **When asked for a Paper's co-authors:**
+            - Retrieve co-authors using:
+                ?paper wdt:P10 ?coAuthorName
+            - Output the STRING values directly.
+            - Do NOT attempt to resolve them to entities.
 
-1. Always fetch labels via SERVICE wikibase:label.  
-   - Never bind labels directly using rdfs:label outside SERVICE.  
+            2. **When asked for a Lecturer's co-authors:**
+            You MUST retrieve co-authors using TWO sources:
 
-2. Name matching must operate only on variables retrieved from SERVICE.  
-   - Example: ?itemLabel from SERVICE.
+            A. STRING-based co-authors:
+                - Traverse Lecturer → Paper → P10
+                - Example:
+                    ?lecturer wdt:P1 ?paper .
+                    ?paper wdt:P10 ?coAuthorName .
 
-3. Honorifics must be ignored when matching names.  
-   - Common honorifics: "mr.", "mrs.", "ms.", "dr.", "prof.", "pak ", "bu ", "bapak ", "ibu "  
-   - Strip honorifics at the start of the label before applying FILTER or REGEX.  
-   - Use SPARQL REPLACE or equivalent function to remove these prefixes.
+            B. ENTITY-based co-authors (other lecturers):
+                - Find other lecturers who wrote the SAME paper:
+                    ?lecturer wdt:P1 ?paper .
+                    ?otherLecturer wdt:P1 ?paper .
+                - Exclude the lecturer themselves:
+                    FILTER(?otherLecturer != ?lecturer)
 
-4. Matching must be case-insensitive and flexible:  
-   - Use REGEX or CONTAINS with LCASE, applied **after stripping honorifics**.  
-   - Example:
-     ```sparql
-     FILTER(REGEX(REPLACE(LCASE(?itemLabel), "^(mr\\.|mrs\\.|ms\\.|dr\\.|prof\\.|pak\\s|bu\\s|bapak\\s|ibu\\s)", ""), "kemas", "i"))
-     ```
+            - Output BOTH:
+                - ?coAuthorName (STRING)
+                - ?otherLecturerLabel (ENTITY)
 
-5. Do NOT include honorifics in the query string.  
-   - If the user asks for "Pak Kemas", the LLM should generate a query for `"kemas"` only.  
+            3. **Do NOT deduplicate between STRING and ENTITY results.**
+            - It is acceptable if the same name appears twice.
 
-6. Always use minimal triple patterns required to answer the question.  
-   - Do not add unnecessary joins, UNIONs, or rdfs:label bindings outside SERVICE.  
+            4. Always include:
+            SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
 
-7. Respect case-insensitive filtering across all name-based queries.
+            NEVER use ?itemLabel for filtering or searching.
+            ALWAYS use rdfs:label in the SEARCH PHASE to bind entities.
+            SERVICE wikibase:label is ONLY for display.
 
-8. This rule applies to **all name searches** in the KG, whether subjects, objects, or people labels.  
+            ────────────────────────────────────────
+            ***CRITICAL STRATEGY FOR 0-RESULT PREVENTION****
+            ────────────────────────────────────────
+            To ensure you find results, you must use this specific search pattern:
+
+            1. **SEARCH PHASE (Finding the Subject):**
+            - NEVER assume you know the Q-ID (e.g., do not guess wd:Q123).
+            - ALWAYS search for the subject by matching its label.
+            - Use `FILTER(CONTAINS(LCASE(?label), "search term"))` which is more robust than REGEX.
+            - **Important:** Search specifically on `rdfs:label`, NOT `wikibase:label`.
+
+            2. **RETRIEVAL PHASE (Traversing):**
+            - Once the variable `?subject` is bound, follow the `wdt:P...` paths.
+
+            3. **DISPLAY PHASE:**
+            - Use `SERVICE wikibase:label` only to get the nice names of the *found* items (the results).
+
+            ────────────────────────────────────────
+            STRICT NAME MATCHING RULES FOR LLM SPARQL GENERATION
+            ────────────────────────────────────────
+
+            1. Always fetch labels via SERVICE wikibase:label.  
+            - Never bind labels directly using rdfs:label outside SERVICE.  
+
+            2. Name matching must operate only on variables retrieved from SERVICE.  
+            - Example: ?itemLabel from SERVICE.
+
+            3. Honorifics must be ignored when matching names.  
+            - Common honorifics: "mr.", "mrs.", "ms.", "dr.", "prof.", "pak ", "bu ", "bapak ", "ibu "  
+            - Strip honorifics at the start of the label before applying FILTER or REGEX.  
+            - Use SPARQL REPLACE or equivalent function to remove these prefixes.
+
+            4. Matching must be case-insensitive and flexible:  
+            - Use REGEX or CONTAINS with LCASE, applied **after stripping honorifics**.  
+            - Example:
+                ```sparql
+                FILTER(REGEX(REPLACE(LCASE(?itemLabel), "^(mr\\.|mrs\\.|ms\\.|dr\\.|prof\\.|pak\\s|bu\\s|bapak\\s|ibu\\s)", ""), "kemas", "i"))
+                ```
+
+            5. Do NOT include honorifics in the query string.  
+            - If the user asks for "Pak Kemas", the LLM should generate a query for `"kemas"` only.  
+
+            6. Always use minimal triple patterns required to answer the question.  
+            - Do not add unnecessary joins, UNIONs, or rdfs:label bindings outside SERVICE.  
+
+            7. Respect case-insensitive filtering across all name-based queries.
+
+            8. This rule applies to **all name searches** in the KG, whether subjects, objects, or people labels.  
 
 
-────────────────────────────────────────
-QUERY RULES
-────────────────────────────────────────
-1. **Partnerships (P6):** - When looking for "partners of Telkom University", first find "Telkom University" via label match.
-   - Then use `?uni wdt:P6 ?partner` to get the list.
-   
-2. **Limits:**
-   - If the user asks for a number (e.g., "3 partners"), add `LIMIT 3` at the end of the query.
+            ────────────────────────────────────────
+            QUERY RULES
+            ────────────────────────────────────────
+            1. **Partnerships (P6):** - When looking for "partners of Telkom University", first find "Telkom University" via label match.
+            - Then use `?uni wdt:P6 ?partner` to get the list.
+            
+            2. **Limits:**
+            - If the user asks for a number (e.g., "3 partners"), add `LIMIT 3` at the end of the query.
 
-3. **Output Format:**
-   - Return ONLY the SPARQL code block. No text, no markdown, no explanations.
+            3. **Output Format:**
+            - Return ONLY the SPARQL code block. No text, no markdown, no explanations.
 
-4. Try to make it that no URL e.g http://38.147.122.59/entity/Q64 appears in the final output, values
+            4. Try to make it that no URL e.g http://38.147.122.59/entity/Q64 appears in the final output, values
 
-5. ALWAYS LIMIT TO 100, UNLESS SPECIFIED OTHERWISE.
+            5. ALWAYS LIMIT TO 150, UNLESS SPECIFIED OTHERWISE.
 
-6. Always Sort alphabetically by the main variable (lecturer/names first, paper second, partner name if needed) for consistent output.
+            6. Always Sort alphabetically by the main variable (lecturer, paper, partner name) for consistent output.
 
-7. for any type of questions regarding lecturers/Dosen, ALWAYS sure to print/output the names
+            7. for any type of questions regarding lecturers/Dosen, ALWAYS sure to print/output the names
 
 
-────────────────────────────────────────
-CURRENT QUESTION
-────────────────────────────────────────
-{question}
-```
+            ────────────────────────────────────────
+            CURRENT QUESTION
+            ────────────────────────────────────────
+            {question}
+            ```
 
 Question: {question}"""
 
@@ -1175,26 +1246,87 @@ Question: {question}"""
         return sparql
     
     def query(self, question: str, stats: ExecutionStats) -> List[Dict]:
-        """Execute SPARQL query against Wikibase"""
+        """Execute SPARQL query against Wikibase, with one retry on 0 results"""
         print("\n" + "-"*80)
         print("WIKIBASE EXECUTOR")
         print("-"*80)
         print(f"Question: {question}")
-        
+
+        def attempt(sparql: str) -> List[Dict]:
+            """Run a single SPARQL query and return bindings."""
+            results = self.wikibase_client.sparql_query(sparql)
+            return results.get('results', {}).get('bindings', [])
+
+        def generate_retry_sparql(question: str, failed_sparql: str) -> str:
+            """Generate a new SPARQL query given the failed one as context."""
+            retry_prompt = f"""
+    You previously generated a SPARQL query for the following question, but it returned 0 results.
+
+    ────────────────────────────────────────
+    ORIGINAL QUESTION
+    ────────────────────────────────────────
+    {question}
+
+    ────────────────────────────────────────
+    FAILED SPARQL QUERY
+    ────────────────────────────────────────
+    {failed_sparql}
+
+    ────────────────────────────────────────
+    YOUR TASK
+    ────────────────────────────────────────
+    The query above returned 0 results. Diagnose why and generate a corrected query.
+
+    Common reasons for 0 results:
+    - Label mismatch: the name filter was too strict (e.g., exact match instead of CONTAINS/REGEX)
+    - Wrong property used (e.g., P3 vs P4 for type checks)
+    - Honorifics not stripped before matching
+    - FILTER applied to ?itemLabel before SERVICE wikibase:label resolved it
+    - Case sensitivity issue
+
+    Apply the same rules as before:
+    - Use FILTER(CONTAINS(LCASE(?label), "...")) on rdfs:label in the search phase
+    - Strip honorifics before matching
+    - Use SERVICE wikibase:label only in the display phase
+    - Return ONLY the SPARQL code block. No explanation, no markdown.
+    - LIMIT 100 unless otherwise specified.
+    """
+            response = self.client.chat.completions.create(
+                model=MODEL_SPARQL_GENERATOR,
+                messages=[
+                    {"role": "system", "content": "You are a SPARQL query expert. Generate only valid SPARQL queries."},
+                    {"role": "user", "content": retry_prompt}
+                ],
+                temperature=0.3  # Slightly higher to encourage a different approach
+            )
+            sparql = response.choices[0].message.content.strip()
+            sparql = sparql.replace("```sparql", "").replace("```", "").strip()
+            return sparql
+
         try:
-            # Generate SPARQL
+            # --- First attempt ---
             sparql = self.generate_sparql(question)
             print(f"\nGenerated SPARQL:\n{sparql}")
             stats.llm_calls += 1
             stats.wikibase_queries.append(sparql)
-            
-            # Execute using WikibaseClient
-            results = self.wikibase_client.sparql_query(sparql)
-            bindings = results.get('results', {}).get('bindings', [])
-            
+
+            bindings = attempt(sparql)
             print(f"✓ Retrieved {len(bindings)} results")
-            return bindings
-            
+
+            if bindings:
+                return bindings
+
+            # --- Retry on 0 results ---
+            print("⚠ 0 results returned. Retrying with a revised query...")
+            retry_sparql = generate_retry_sparql(question, sparql)
+            print(f"\nRetry SPARQL:\n{retry_sparql}")
+            stats.llm_calls += 1
+            stats.wikibase_queries.append(retry_sparql)
+
+            retry_bindings = attempt(retry_sparql)
+            print(f"✓ Retry retrieved {len(retry_bindings)} results")
+            return retry_bindings
+
         except Exception as e:
             print(f"❌ Wikibase execution error: {e}")
             return []
@@ -1683,7 +1815,7 @@ class AnswerSynthesizer:
                             f"partner_name, title, and summary):"
                         )
                     }
-                ] # was 500 — gives room for complete extraction
+                ]
             )
             return f"[{source_label}]\n{resp.choices[0].message.content.strip()}"
         except Exception as e:
@@ -1801,8 +1933,8 @@ class AnswerSynthesizer:
                             "Synthesize a clear, complete answer and cite sources explicitly "
                             "(e.g. 'According to Partnership News #3...' or 'Wikidata reports...'). "
                             "all names given are the names of Lektors,, regardless of their positions"
-                            "If the question asks for a list, include ALL items found in the context — "
-                            "do not summarize or truncate the list."
+                            "If the question asks for a list, include ALL items found in the context (Except Duplicates) "
+                            "do not summarize or truncate the list. (unless there are duplicates)"
                         )
                     },
                     {
@@ -1815,7 +1947,7 @@ class AnswerSynthesizer:
                             f"Do not omit any item found in the context."
                         )
                     }
-                ]  # explicit ceiling so long lists aren't cut off
+                ] # explicit ceiling so long lists aren't cut off
             )
             stats.llm_calls += 1
             return resp.choices[0].message.content.strip()
