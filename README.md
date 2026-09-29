@@ -63,3 +63,7 @@ All credentials come from environment variables. See `.env.example` for the full
 ## Citation
 
 The paper is currently under review. Citation details will be added on publication.
+
+## License
+
+MIT. See `LICENSE`.
